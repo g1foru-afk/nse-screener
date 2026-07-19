@@ -1,14 +1,14 @@
 name: Daily NSE Pre-Market Watchlist
 
 on:
-  schedule:
-    # 02:15 UTC = 07:45 IST, gives ~1hr buffer before 9:00 AM IST.
-    # GitHub's scheduled cron is best-effort and can run a few (sometimes
-    # many) minutes late during high load — if you need a hard 9:00 AM
-    # guarantee, run this on your own machine/VM via cron/Task Scheduler
-    # instead (nse_eod_screener.py + daily_run.py work identically there).
-    - cron: '15 2 * * 1-5'   # Mon-Fri
-  workflow_dispatch: {}       # allows manual "Run workflow" button for testing
+  # Schedule disabled: GitHub-hosted runners are IP-blocked by NSE
+  # (confirmed via live run, matches upstream issue #9 in the nse
+  # package repo). This job now runs locally via Windows Task Scheduler
+  # -- see run_daily.bat and the "Windows Task Scheduler setup" section
+  # in README.md. workflow_dispatch is left enabled only in case you
+  # ever move this to a self-hosted runner or non-blocked cloud host.
+  # - cron: '15 2 * * 1-5'
+  workflow_dispatch: {}
 
 permissions:
   contents: write
