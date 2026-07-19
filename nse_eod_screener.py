@@ -86,7 +86,7 @@ def fetch_range(days: int) -> pd.DataFrame:
     DOWNLOAD_DIR.mkdir(exist_ok=True)
     frames = []
     missed_dates = []
-    with NSE(download_folder=DOWNLOAD_DIR) as nse:
+    with NSE(download_folder=DOWNLOAD_DIR, server=True, timeout=30) as nse:
         d = datetime.today()
         fetched = 0
         attempts = 0
@@ -199,7 +199,7 @@ def screen(df: pd.DataFrame, top_n: int = 20) -> pd.DataFrame:
 
 
 def fetch_nifty_history(from_date, to_date) -> pd.DataFrame:
-    with NSE(download_folder=DOWNLOAD_DIR) as nse:
+    with NSE(download_folder=DOWNLOAD_DIR, server=True, timeout=30) as nse:
         records = nse.fetch_historical_index_data(
             index="NIFTY 50", from_date=from_date, to_date=to_date
         )
