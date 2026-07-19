@@ -33,7 +33,7 @@ def main():
     shortlist = screen(data, top_n=args.shortlist_top)
 
     print("Step 3/4: validating news for shortlisted symbols...")
-    with NSE(download_folder=DOWNLOAD_DIR) as nse:
+    with NSE(download_folder=DOWNLOAD_DIR, server=True, timeout=30) as nse:
         final_df = enrich_watchlist_with_news(shortlist, nse=nse)
 
     final_df.to_csv("watchlist_final.csv", index=False)
