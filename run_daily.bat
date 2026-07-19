@@ -5,10 +5,12 @@ REM Edit REPO_DIR below to the actual path where you cloned the
 REM nse-screener repo, then point Task Scheduler at this .bat file.
 REM ============================================================
 
-set REPO_DIR=C:\Users\YOURNAME\nse-screener
+set REPO_DIR=E:\GitHub\Projects\nse-screener
 set LOGFILE=%REPO_DIR%\run_log.txt
 
 cd /d "%REPO_DIR%" || (echo Could not cd to %REPO_DIR% & exit /b 1)
+set GIT_EDITOR=true
+git config core.editor true >nul 2>&1
 
 echo ==== Run started %DATE% %TIME% ==== >> "%LOGFILE%"
 
@@ -21,8 +23,12 @@ if errorlevel 1 (
     exit /b 1
 )
 
+git pull --no-edit >> "%LOGFILE%" 2>&1
 git add docs\index.html watchlist_final.csv >> "%LOGFILE%" 2>&1
 git commit -m "Daily watchlist update %DATE%" >> "%LOGFILE%" 2>&1
 git push >> "%LOGFILE%" 2>&1
+if errorlevel 1 (
+    echo Push FAILED - remote likely has changes not pulled, check manually >> "%LOGFILE%"
+)
 
 echo ==== Run finished %DATE% %TIME% ==== >> "%LOGFILE%"
