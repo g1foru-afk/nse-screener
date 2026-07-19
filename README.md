@@ -63,7 +63,7 @@ or selling anything. Read the linked headlines before acting on anything.
 **Command-line alternative** (run once in an elevated Command Prompt,
 adjust the path):
 ```
-schtasks /create /tn "NSE Daily Watchlist" /tr "C:\Users\yourname\nse-screener\run_daily.bat" /sc weekly /d MON,TUE,WED,THU,FRI /st 07:45 /rl HIGHEST
+schtasks /create /tn "NSE Daily Watchlist" /tr "E:\GitHub\Projects\nse-screener\run_daily.bat" /sc weekly /d MON,TUE,WED,THU,FRI /st 07:45 /rl HIGHEST
 ```
 
 **Reality check:** this only works if your PC is on, awake, and has
