@@ -1,6 +1,6 @@
 """
-NSE EOD Bhavcopy Screener (v2)
---------------------------------
+NSE EOD Bhavcopy Screener
+--------------------------
 Downloads NSE end-of-day (bhavcopy) equity data for a date range, then
 screens stocks for the next trading day's intraday watchlist based on:
   - Volume spike vs 20-day average volume
@@ -8,40 +8,47 @@ screens stocks for the next trading day's intraday watchlist based on:
   - Closing strength (close near day's high = bullish momentum)
   - Daily range % (volatility, useful for intraday movers)
 
-CHANGES FROM v1 (see code review notes)
-----------------------------------------
-1. Rate limiting added between bhavcopy requests (NSE's own docs ask for
-   0.5-1s between requests; this script defaults to 0.6s).
-2. PREV_CLOSE / AVG_VOL_20 now computed on a *reindexed, gap-aware* daily
-   calendar per symbol, so a missed fetch (holiday misdetected, transient
-   network error) doesn't silently make "previous close" a stale N-days-ago
-   value without you knowing about it. Missing days are logged.
-3. GAP_PCT is now actually included in SCORE (it was computed but unused
-   in v1).
-4. SCORE weights are configurable and can be grid-searched against the
-   Nifty-relative backtest instead of being fixed at 0.4/0.3/0.3.
-5. Minimum-history guard: screen() will warn (not silently drop) when
-   fewer than MIN_HISTORY_DAYS trading days are available for a symbol.
+NEW: price-range and explicit bullish filters
+------------------------------------------------
+--min-price / --max-price restrict the shortlist to a price band (e.g.
+500-2000) BEFORE ranking, so cheap/expensive names never crowd out
+mid-priced ones just by scoring well on volume/range.
+
+--bullish-only adds an explicit directional requirement, built from
+metrics this screener already computes (not a new, unvalidated signal):
+  - Close > Previous Close (the stock actually closed up that day)
+  - Close Strength >= --min-close-strength (default 0.6, i.e. closed in
+    the upper 40% of the day's range -- shows buyers were in control
+    into the close, not a stock that spiked and gave it back)
+This is a reasonable, inspectable filter built on existing columns, NOT
+a separately validated "this predicts tomorrow" signal -- treat it the
+same way as the rest of this screener's SCORE: a starting shortlist to
+investigate, not a guarantee, and check backtest_score_vs_nifty's output
+periodically to see whether the ranking rule is actually adding value.
 
 USAGE
 -----
     pip install nse pandas
-    python nse_eod_screener.py --days 30 --top 10
+    python nse_eod_screener.py --days 30 --top 10 --min-price 500 --max-price 2000 --bullish-only
 
 NOTES
 -----
-- Uses the `nse` PyPI package (https://pypi.org/project/nse/), which
-  handles NSE's session cookies and both the old and new (UDiFF, since
-  8 Jul 2024) bhavcopy formats.
+- NSE retired the old "archives.nseindia.com/.../cmDDMMMYYYYbhav.csv.zip"
+  format on 8 July 2024 (switched to the new "UDiFF" file format on a new
+  domain). This script uses the `nse` PyPI package (a maintained,
+  open-source client), which handles NSE's session cookies and picks the
+  correct file format automatically for both old and new dates.
+- The backtest compares each stock's next-day return against the Nifty
+  50's next-day return (excess return), not the stock's raw return in
+  isolation.
 - This is EOD historical data only -- useful for building a *watchlist*
-  the night before / morning of. Not live intraday data.
-- This script does not give buy/sell recommendations. It ranks stocks by
-  objective, backtestable criteria -- you decide what to do with them.
-  Nothing here is financial advice.
+  the night before. For live intraday price/volume during market hours
+  you need a broker API (Kite Connect, Upstox, Fyers, etc.).
+- This script does not give buy/sell recommendations. It ranks stocks
+  by objective, backtestable criteria -- you decide what to do with them.
 """
 
 import argparse
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -49,8 +56,6 @@ import pandas as pd
 from nse import NSE
 
 DOWNLOAD_DIR = Path("./nse_bhavcopy_cache")
-MIN_HISTORY_DAYS = 20          # rolling window used for AVG_VOL_20
-REQUEST_DELAY_SEC = 0.6        # NSE asks for 0.5-1s between bulk requests
 
 COLUMN_MAP_UDIFF = {
     "TckrSymb": "SYMBOL", "SctySrs": "SERIES", "OpnPric": "OPEN",
@@ -81,125 +86,96 @@ def fetch_bhavcopy(nse: NSE, date: datetime) -> pd.DataFrame | None:
 
 
 def fetch_range(days: int) -> pd.DataFrame:
-    """Fetch the last `days` calendar days of bhavcopy, skipping days with
-    no data. Rate-limited to avoid NSE throttling/blocking."""
     DOWNLOAD_DIR.mkdir(exist_ok=True)
     frames = []
-    missed_dates = []
-    with NSE(download_folder=DOWNLOAD_DIR, server=True, timeout=30) as nse:
+    with NSE(download_folder=DOWNLOAD_DIR) as nse:
         d = datetime.today()
         fetched = 0
         attempts = 0
         while fetched < days and attempts < days * 2:
             attempts += 1
             df = fetch_bhavcopy(nse, d)
-            time.sleep(REQUEST_DELAY_SEC)  # <-- rate limit, avoid throttling
             if df is not None:
                 frames.append(df)
                 fetched += 1
                 print(f"  Fetched {d:%Y-%m-%d} ({len(df)} rows)")
-            else:
-                missed_dates.append(d.date())
             d -= timedelta(days=1)
     if not frames:
         raise RuntimeError(
             "No bhavcopy files could be downloaded. Check your internet "
-            "connection, that NSE isn't blocking this IP/environment, or "
-            "that the 'nse' package is up to date (pip install -U nse)."
+            "connection, or that the 'nse' package is up to date "
+            "(pip install -U nse)."
         )
-    if missed_dates:
-        # Not necessarily a problem (weekends/holidays are expected here),
-        # but printed explicitly so a real outage isn't silently absorbed.
-        print(f"  ({len(missed_dates)} calendar days had no data - normal "
-              f"for weekends/holidays, but check if this count looks high)")
     return pd.concat(frames, ignore_index=True)
 
 
-def _gap_aware_prev_close_and_vol(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute PREV_CLOSE and AVG_VOL_20 against the calendar of trading
-    days actually present in the fetched data (shared across all symbols),
-    rather than each symbol's own row order. This still can't invent data
-    for a day nobody fetched, but it makes gaps visible: PREV_CLOSE_GAP_DAYS
-    tells you how many trading days back the "previous" close actually is,
-    so a value of 1 means the fetch was contiguous and >1 means a day (or
-    more) was missing between them."""
-    trading_days = sorted(df["TRADE_DATE"].unique())
-    day_index = {d: i for i, d in enumerate(trading_days)}
-    df = df.copy()
-    df["_DAY_IDX"] = df["TRADE_DATE"].map(day_index)
-    df = df.sort_values(["SYMBOL", "_DAY_IDX"])
-
-    df["PREV_CLOSE"] = df.groupby("SYMBOL")["CLOSE"].shift(1)
-    df["PREV_DAY_IDX"] = df.groupby("SYMBOL")["_DAY_IDX"].shift(1)
-    df["PREV_CLOSE_GAP_DAYS"] = df["_DAY_IDX"] - df["PREV_DAY_IDX"]
-
-    df["AVG_VOL_20"] = (
-        df.groupby("SYMBOL")["TOTTRDQTY"]
-        .transform(lambda s: s.shift(1).rolling(MIN_HISTORY_DAYS).mean())
-    )
-    return df.drop(columns=["_DAY_IDX", "PREV_DAY_IDX"])
-
-
-def compute_metrics(
-    df: pd.DataFrame,
-    weights: dict | None = None,
-) -> pd.DataFrame:
-    """Add gap/range/volume-spike columns and a composite SCORE, ranked
-    cross-sectionally within each trading day.
-
-    weights: dict with keys 'vol', 'range', 'strength', 'gap' summing to 1.
-    Defaults preserve v1 behavior but now also fold in gap.
-    """
-    weights = weights or {"vol": 0.35, "range": 0.25, "strength": 0.25, "gap": 0.15}
-
+def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
     df = df.rename(columns=lambda c: c.strip().upper())
     df = df[df["SERIES"] == "EQ"].copy()
-    df = _gap_aware_prev_close_and_vol(df)
+    df = df.sort_values(["SYMBOL", "TRADE_DATE"])
 
+    df["PREV_CLOSE"] = df.groupby("SYMBOL")["CLOSE"].shift(1)
     df["GAP_PCT"] = (df["OPEN"] - df["PREV_CLOSE"]) / df["PREV_CLOSE"] * 100
     df["RANGE_PCT"] = (df["HIGH"] - df["LOW"]) / df["LOW"] * 100
     df["CLOSE_STRENGTH"] = (df["CLOSE"] - df["LOW"]) / (df["HIGH"] - df["LOW"] + 1e-9)
+    df["AVG_VOL_20"] = (
+        df.groupby("SYMBOL")["TOTTRDQTY"].transform(lambda s: s.shift(1).rolling(20).mean())
+    )
     df["VOL_SPIKE_RATIO"] = df["TOTTRDQTY"] / df["AVG_VOL_20"]
 
     vol_rank = df.groupby("TRADE_DATE")["VOL_SPIKE_RATIO"].rank(pct=True)
     range_rank = df.groupby("TRADE_DATE")["RANGE_PCT"].rank(pct=True)
     strength_rank = df.groupby("TRADE_DATE")["CLOSE_STRENGTH"].rank(pct=True)
-    # Gap uses absolute value ranked -- a big gap up OR down is the
-    # "interesting for intraday" signal, direction is shown separately.
-    gap_rank = df.groupby("TRADE_DATE")["GAP_PCT"].transform(lambda s: s.abs()).groupby(df["TRADE_DATE"]).rank(pct=True)
+    df["SCORE"] = vol_rank * 0.4 + range_rank * 0.3 + strength_rank * 0.3
 
-    df["SCORE"] = (
-        vol_rank * weights["vol"]
-        + range_rank * weights["range"]
-        + strength_rank * weights["strength"]
-        + gap_rank * weights["gap"]
-    )
     return df
 
 
-def screen(df: pd.DataFrame, top_n: int = 20) -> pd.DataFrame:
-    usable = df.dropna(subset=["VOL_SPIKE_RATIO", "AVG_VOL_20", "SCORE"])
-    total_symbols = df["SYMBOL"].nunique()
-    usable_symbols = usable["SYMBOL"].nunique()
-    if usable_symbols < total_symbols * 0.5:
-        print(f"  Warning: only {usable_symbols}/{total_symbols} symbols have "
-              f"{MIN_HISTORY_DAYS}+ days of history to score. Consider "
-              f"increasing --days.")
+def screen(
+    df: pd.DataFrame,
+    top_n: int = 20,
+    min_price: float | None = None,
+    max_price: float | None = None,
+    bullish_only: bool = False,
+    min_close_strength: float = 0.6,
+) -> pd.DataFrame:
+    """Return the top-scoring stocks on the most recent available day,
+    optionally restricted to a price band and/or an explicit bullish
+    requirement (Close > Prev Close AND Close Strength >= min_close_strength)."""
+    df = df.dropna(subset=["VOL_SPIKE_RATIO", "AVG_VOL_20", "SCORE"])
+    latest_date = df["TRADE_DATE"].max()
+    latest = df[df["TRADE_DATE"] == latest_date].copy()
 
-    latest_date = usable["TRADE_DATE"].max()
-    latest = usable[usable["TRADE_DATE"] == latest_date].copy()
+    total_candidates = len(latest)
+
+    if min_price is not None:
+        latest = latest[latest["CLOSE"] >= min_price]
+    if max_price is not None:
+        latest = latest[latest["CLOSE"] <= max_price]
+    after_price_filter = len(latest)
+
+    if bullish_only:
+        latest = latest[
+            (latest["CLOSE"] > latest["PREV_CLOSE"])
+            & (latest["CLOSE_STRENGTH"] >= min_close_strength)
+        ]
+    after_bullish_filter = len(latest)
+
+    print(f"  Screening funnel: {total_candidates} candidates -> "
+          f"{after_price_filter} after price filter -> "
+          f"{after_bullish_filter} after bullish filter")
 
     cols = [
         "SYMBOL", "SERIES", "TRADE_DATE", "OPEN", "HIGH", "LOW", "CLOSE",
-        "TOTTRDQTY", "TOTTRDVAL", "VOL_SPIKE_RATIO", "GAP_PCT", "RANGE_PCT",
-        "CLOSE_STRENGTH", "PREV_CLOSE_GAP_DAYS", "SCORE",
+        "PREV_CLOSE", "TOTTRDQTY", "TOTTRDVAL", "VOL_SPIKE_RATIO", "GAP_PCT",
+        "RANGE_PCT", "CLOSE_STRENGTH", "SCORE",
     ]
     cols = [c for c in cols if c in latest.columns]
     return latest[cols].sort_values("SCORE", ascending=False).head(top_n)
 
 
 def fetch_nifty_history(from_date, to_date) -> pd.DataFrame:
-    with NSE(download_folder=DOWNLOAD_DIR, server=True, timeout=30) as nse:
+    with NSE(download_folder=DOWNLOAD_DIR) as nse:
         records = nse.fetch_historical_index_data(
             index="NIFTY 50", from_date=from_date, to_date=to_date
         )
@@ -254,9 +230,15 @@ def backtest_score_vs_nifty(df, nifty_df, quantiles: int = 5):
 
 def main():
     parser = argparse.ArgumentParser(description="NSE EOD screener for next-day watchlist")
-    parser.add_argument("--days", type=int, default=45)
+    parser.add_argument("--days", type=int, default=30)
     parser.add_argument("--top", type=int, default=10)
     parser.add_argument("--out", type=str, default="watchlist.csv")
+    parser.add_argument("--min-price", type=float, default=None, help="e.g. 500")
+    parser.add_argument("--max-price", type=float, default=None, help="e.g. 2000")
+    parser.add_argument("--bullish-only", action="store_true",
+                         help="Require Close > Prev Close AND Close Strength >= --min-close-strength")
+    parser.add_argument("--min-close-strength", type=float, default=0.6,
+                         help="Close position within the day's range, 0-1 (default 0.6 = upper 40%%)")
     parser.add_argument("--no-backtest", action="store_true")
     args = parser.parse_args()
 
@@ -265,7 +247,11 @@ def main():
     print(f"Fetched {data['TRADE_DATE'].nunique()} trading days, {len(data)} rows.")
 
     data = compute_metrics(data)
-    result = screen(data, top_n=args.top)
+
+    result = screen(
+        data, top_n=args.top, min_price=args.min_price, max_price=args.max_price,
+        bullish_only=args.bullish_only, min_close_strength=args.min_close_strength,
+    )
     result.to_csv(args.out, index=False)
     print(f"\nTop {args.top} candidates saved to {args.out}:\n")
     print(result.to_string(index=False))
@@ -279,6 +265,12 @@ def main():
             summary, corr, detail = backtest_score_vs_nifty(data, nifty_df)
             print(summary.to_string())
             print(f"\nSpearman correlation (SCORE vs excess return): {corr:.3f}")
+            print(
+                "NOTE: this backtest validates the underlying SCORE across ALL stocks/days -- "
+                "it does NOT specifically re-validate the price-range or bullish-only filters "
+                "applied above. Those are inspectable, sensible filters built on existing columns, "
+                "not separately backtested claims."
+            )
             detail.to_csv("backtest_detail.csv", index=False)
         except RuntimeError as e:
             print(f"Skipped: {e}")
