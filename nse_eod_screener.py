@@ -56,6 +56,7 @@ import pandas as pd
 from nse import NSE
 
 DOWNLOAD_DIR = Path("./nse_bhavcopy_cache")
+MIN_HISTORY_DAYS = 15
 
 COLUMN_MAP_UDIFF = {
     "TckrSymb": "SYMBOL", "SctySrs": "SERIES", "OpnPric": "OPEN",
@@ -116,17 +117,30 @@ def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
 
     df["PREV_CLOSE"] = df.groupby("SYMBOL")["CLOSE"].shift(1)
     df["GAP_PCT"] = (df["OPEN"] - df["PREV_CLOSE"]) / df["PREV_CLOSE"] * 100
-    df["RANGE_PCT"] = (df["HIGH"] - df["LOW"]) / df["LOW"] * 100
+    df["DAILY_RANGE_PCT"] = (df["HIGH"] - df["LOW"]) / df["LOW"] * 100
+    df["RANGE_PCT"] = df["DAILY_RANGE_PCT"]
     df["CLOSE_STRENGTH"] = (df["CLOSE"] - df["LOW"]) / (df["HIGH"] - df["LOW"] + 1e-9)
     df["AVG_VOL_20"] = (
         df.groupby("SYMBOL")["TOTTRDQTY"].transform(lambda s: s.shift(1).rolling(20).mean())
     )
     df["VOL_SPIKE_RATIO"] = df["TOTTRDQTY"] / df["AVG_VOL_20"]
 
-    vol_rank = df.groupby("TRADE_DATE")["VOL_SPIKE_RATIO"].rank(pct=True)
-    range_rank = df.groupby("TRADE_DATE")["RANGE_PCT"].rank(pct=True)
-    strength_rank = df.groupby("TRADE_DATE")["CLOSE_STRENGTH"].rank(pct=True)
-    df["SCORE"] = vol_rank * 0.4 + range_rank * 0.3 + strength_rank * 0.3
+    df["HIST_VOL_MA15"] = df.groupby("SYMBOL")["DAILY_RANGE_PCT"].transform(
+        lambda s: s.shift(1).rolling(15).mean()
+    )
+    df["COMPRESSION_RATIO"] = df["DAILY_RANGE_PCT"] / (df["HIST_VOL_MA15"] + 1e-9)
+    df["AVG_VOL_15"] = df.groupby("SYMBOL")["TOTTRDQTY"].transform(
+        lambda s: s.shift(1).rolling(15).mean()
+    )
+    df["VOL_DRYUP_RATIO"] = df["TOTTRDQTY"] / df["AVG_VOL_15"]
+
+    range_compression_rank = df.groupby("TRADE_DATE")["COMPRESSION_RATIO"].rank(
+        pct=True, ascending=False
+    )
+    volume_dryup_rank = df.groupby("TRADE_DATE")["VOL_DRYUP_RATIO"].rank(
+        pct=True, ascending=False
+    )
+    df["SCORE"] = range_compression_rank * 0.6 + volume_dryup_rank * 0.4
 
     return df
 
@@ -142,7 +156,7 @@ def screen(
     """Return the top-scoring stocks on the most recent available day,
     optionally restricted to a price band and/or an explicit bullish
     requirement (Close > Prev Close AND Close Strength >= min_close_strength)."""
-    df = df.dropna(subset=["VOL_SPIKE_RATIO", "AVG_VOL_20", "SCORE"])
+    df = df.dropna(subset=["COMPRESSION_RATIO", "VOL_DRYUP_RATIO", "SCORE"])
     latest_date = df["TRADE_DATE"].max()
     latest = df[df["TRADE_DATE"] == latest_date].copy()
 
@@ -167,8 +181,8 @@ def screen(
 
     cols = [
         "SYMBOL", "SERIES", "TRADE_DATE", "OPEN", "HIGH", "LOW", "CLOSE",
-        "PREV_CLOSE", "TOTTRDQTY", "TOTTRDVAL", "VOL_SPIKE_RATIO", "GAP_PCT",
-        "RANGE_PCT", "CLOSE_STRENGTH", "SCORE",
+        "PREV_CLOSE", "TOTTRDQTY", "TOTTRDVAL", "VOL_DRYUP_RATIO",
+        "COMPRESSION_RATIO", "GAP_PCT", "RANGE_PCT", "CLOSE_STRENGTH", "SCORE",
     ]
     cols = [c for c in cols if c in latest.columns]
     return latest[cols].sort_values("SCORE", ascending=False).head(top_n)

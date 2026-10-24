@@ -85,7 +85,7 @@ CARD_TEMPLATE = """
     <div><span>Close:</span> {close}</div>
     <div><span>Gap %:</span> {gap_pct:.2f}</div>
     <div><span>Range %:</span> {range_pct:.2f}</div>
-    <div><span>Vol spike:</span> {vol_spike:.2f}x</div>
+    <div><span>Vol dry-up:</span> {vol_dryup:.2f}x</div>
     <div><span>Close strength:</span> {close_strength:.2f}</div>
     <div><span>Tech score:</span> {tech_score:.2f}</div>
   </div>
@@ -126,7 +126,7 @@ def build_dashboard(final_df: pd.DataFrame, out_path: str = "docs/index.html", t
             close=row.get("CLOSE", "-"),
             gap_pct=row.get("GAP_PCT", 0.0),
             range_pct=row.get("RANGE_PCT", 0.0),
-            vol_spike=row.get("VOL_SPIKE_RATIO", 0.0),
+            vol_dryup=row.get("VOL_DRYUP_RATIO", 0.0),
             close_strength=row.get("CLOSE_STRENGTH", 0.0),
             tech_score=row.get("SCORE", 0.0),
             excluded_class="excluded" if excluded else "",
